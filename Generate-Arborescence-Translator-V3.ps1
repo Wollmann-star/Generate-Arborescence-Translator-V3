@@ -346,7 +346,10 @@ function Get-ItemsForRenaming {
     $allItems = Get-ChildItem -Path $RootPath -Recurse -ErrorAction SilentlyContinue
     
     # Sort by depth (longest path first = deepest first)
-    $allItems = $allItems | Sort-Object { ($_.FullName -split '([char][System.IO.Path]::DirectorySeparatorChar)').Count } -Descending
+    # Calculate depth by counting directory separators
+    $allItems = $allItems | Sort-Object { 
+        $_.FullName.Split([System.IO.Path]::DirectorySeparatorChar).Count 
+    } -Descending
     
     foreach ($item in $allItems) {
         if (Test-ContainsChinese -Text $item.Name) {
@@ -368,7 +371,7 @@ function Get-ItemsForRenaming {
                     NewName     = $translation
                     ItemType    = if ($item.PSIsContainer) { "Folder" } else { "File" }
                     HasChinese  = $true
-                    Depth       = ($item.FullName -split '([char][System.IO.Path]::DirectorySeparatorChar)').Count
+                    Depth       = $item.FullName.Split([System.IO.Path]::DirectorySeparatorChar).Count
                 }
             }
         }
@@ -407,8 +410,12 @@ function Invoke-SafeRename {
     }
     
     try {
+        # Important: Re-fetch the parent path at rename time because parent folders may have been renamed
+        # This is critical for folder renaming to work correctly in nested structures
+        $currentParentPath = Split-Path -Path $Item.FullPath -Parent
+        
         # Check if target already exists
-        $targetPath = Join-Path $Item.ParentPath $Item.NewName
+        $targetPath = Join-Path $currentParentPath $Item.NewName
         if ((Test-Path -Path $targetPath) -and ($targetPath -ne $Item.FullPath)) {
             # Handle naming conflict by appending a unique suffix
             $baseName = $Item.NewName
@@ -427,7 +434,7 @@ function Invoke-SafeRename {
             $counter = 1
             do {
                 $newNameWithSuffix = "${baseName}_${counter}${extension}"
-                $targetPath = Join-Path $Item.ParentPath $newNameWithSuffix
+                $targetPath = Join-Path $currentParentPath $newNameWithSuffix
                 $counter++
             } while ((Test-Path -Path $targetPath) -and ($counter -lt 100))
             
@@ -520,7 +527,13 @@ if ($FilesOnly) {
 }
 
 $itemsToRename = Get-ItemsForRenaming -RootPath $rootResolved
-Write-Host "Items ready for renaming: $($itemsToRename.Count)" -ForegroundColor Cyan
+
+# Separate folders and files for proper renaming order
+$foldersToRename = $itemsToRename | Where-Object { $_.ItemType -eq "Folder" }
+$filesToRename = $itemsToRename | Where-Object { $_.ItemType -eq "File" }
+
+Write-Host "Folders ready for renaming: $($foldersToRename.Count)" -ForegroundColor Cyan
+Write-Host "Files ready for renaming: $($filesToRename.Count)" -ForegroundColor Cyan
 
 # Log translate cache
 Write-Host ""
@@ -529,7 +542,7 @@ $script:translationCache.GetEnumerator() | ForEach-Object {
     Write-Host "  $($_.Key) → $($_.Value)" -ForegroundColor DarkGray
 }
 
-# Rename phase
+# Rename phase - Folders first (deepest first), then files
 Write-Host ""
 Write-Host "♻️  PHASE 4: FILESYSTEM RENAMING" -ForegroundColor Yellow
 Write-Host "─────────────────────────────────────────────────────────────"
@@ -539,9 +552,67 @@ if ($WhatIf) {
 }
 
 $renameCount = 0
-foreach ($item in $itemsToRename) {
+$folderCount = 0
+$fileCount = 0
+
+# Rename folders first (already sorted deepest-first)
+foreach ($item in $foldersToRename) {
+    # Critical: Re-resolve the current path because parent folders may have been renamed
+    # We need to find the item by its original name within its (possibly renamed) parent chain
+    $currentPath = $item.FullPath
+    
+    # If the stored path doesn't exist, try to reconstruct it by walking up the tree
+    if (-not (Test-Path -Path $currentPath)) {
+        # Find the item by navigating from root using original component names
+        $relativePath = $currentPath.Substring($rootResolved.Length).TrimStart('\', '/')
+        $pathParts = $relativePath.Split([System.IO.Path]::DirectorySeparatorChar)
+        
+        $testPath = $rootResolved
+        foreach ($part in $pathParts) {
+            $found = $false
+            if (Test-Path -Path $testPath) {
+                $children = Get-ChildItem -Path $testPath -ErrorAction SilentlyContinue
+                foreach ($child in $children) {
+                    if ($child.Name -eq $part) {
+                        $testPath = $child.FullName
+                        $found = $true
+                        break
+                    }
+                }
+            }
+            if (-not $found) {
+                Write-Host "  ⚠️  WARNING: Could not find folder '$part' in '$testPath'" -ForegroundColor Yellow
+                break
+            }
+        }
+        $currentPath = $testPath
+    }
+    
+    # Update the item's FullPath for the rename operation
+    $item.FullPath = $currentPath
+    $item.ParentPath = Split-Path -Path $currentPath -Parent
+    
     $status = Invoke-SafeRename -Item $item -WhatIfMode $WhatIf
     $renameCount++
+    $folderCount++
+    
+    # Log entry
+    $script:renameLog.Add(@{
+        OriginalPath = $status.OriginalPath
+        OriginalName = $status.OriginalName
+        Translation  = $status.NewName
+        ItemType     = $status.ItemType
+        Status       = if ($status.Success) { "Success" } else { "Failed" }
+        Message      = $status.Message
+        Timestamp    = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    })
+}
+
+# Then rename files
+foreach ($item in $filesToRename) {
+    $status = Invoke-SafeRename -Item $item -WhatIfMode $WhatIf
+    $renameCount++
+    $fileCount++
     
     # Log entry
     $script:renameLog.Add(@{
@@ -556,7 +627,7 @@ foreach ($item in $itemsToRename) {
 }
 
 Write-Host ""
-Write-Host "Rename operations completed: $renameCount" -ForegroundColor Cyan
+Write-Host "Rename operations completed: $renameCount (Folders: $folderCount, Files: $fileCount)" -ForegroundColor Cyan
 
 # Rebuild tree AFTER renaming (if not in WhatIf mode)
 Write-Host ""
@@ -632,6 +703,8 @@ $reportLines.Add("| **Translation service** | ``$TranslationService`` |")
 $reportLines.Add("| **Total folders (entire scan)** | $totalFolders |")
 $reportLines.Add("| **Total files (entire scan)** | $totalFiles |")
 $reportLines.Add("| **Items with Chinese characters** | $($script:itemsWithChinese) |")
+$reportLines.Add("| **Folders renamed** | $folderCount |")
+$reportLines.Add("| **Files renamed** | $fileCount |")
 $reportLines.Add("| **Items renamed** | $($script:renameLog.Count) |")
 $reportLines.Add("| **Successful renames** | $($script:renameLog | Where-Object { $_.Status -eq 'Success' } | Measure-Object | Select-Object -ExpandProperty Count) |")
 $reportLines.Add("| **Failed renames** | $($script:renameLog | Where-Object { $_.Status -eq 'Failed' } | Measure-Object | Select-Object -ExpandProperty Count) |")
@@ -693,17 +766,14 @@ $reportLines.Add("")
 # Summary
 $reportLines.Add("## 📊 Summary")
 $reportLines.Add("")
-$reportLines.Add("- **Total items processed:** $($script:processedCount)")
+$reportLines.Add("- **Total folders scanned:** $totalFolders")
+$reportLines.Add("- **Total files scanned:** $totalFiles")
 $reportLines.Add("- **Chinese characters detected:** $($script:itemsWithChinese)")
 $reportLines.Add("- **Translation operations:** $($script:translationCache.Count)")
 $reportLines.Add("- **Rename operations:** $($script:renameLog.Count)")
+$reportLines.Add("- **Folders renamed:** $folderCount")
+$reportLines.Add("- **Files renamed:** $fileCount")
 $reportLines.Add("")
-
-# Count folders and files renamed
-$foldersRenamed = ($script:renameLog | Where-Object { $_.ItemType -eq 'Folder' } | Measure-Object | Select-Object -ExpandProperty Count)
-$filesRenamed = ($script:renameLog | Where-Object { $_.ItemType -eq 'File' } | Measure-Object | Select-Object -ExpandProperty Count)
-$reportLines.Add("- **Folders renamed:** $foldersRenamed")
-$reportLines.Add("- **Files renamed:** $filesRenamed")
 
 if ($WhatIf) {
     $reportLines.Add("> ⚠️  **This report was generated in WHATIF mode.** No actual filesystem changes were made.")
