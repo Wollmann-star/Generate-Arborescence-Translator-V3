@@ -342,6 +342,9 @@ function Get-ItemsForRenaming {
     
     $itemsToRename = @()
     
+    # Normalize root path (remove trailing separator if present)
+    $RootPath = $RootPath.TrimEnd('\', '/')
+    
     # Get all items recursively
     $allItems = Get-ChildItem -Path $RootPath -Recurse -ErrorAction SilentlyContinue
     
@@ -364,6 +367,9 @@ function Get-ItemsForRenaming {
             
             # Only create rename entry if translation differs
             if ($translation -ne $item.Name) {
+                # Calculate relative path from root (handle both Linux and Windows paths)
+                $relativePath = $item.FullName.Substring($RootPath.Length + 1)
+                
                 $itemsToRename += @{
                     FullPath    = $item.FullName
                     ParentPath  = $item.Directory.FullName
@@ -372,6 +378,8 @@ function Get-ItemsForRenaming {
                     ItemType    = if ($item.PSIsContainer) { "Folder" } else { "File" }
                     HasChinese  = $true
                     Depth       = $item.FullName.Split([System.IO.Path]::DirectorySeparatorChar).Count
+                    # Store the relative path from root for dynamic path resolution
+                    RelativePath = $relativePath
                 }
             }
         }
@@ -558,34 +566,47 @@ $fileCount = 0
 # Rename folders first (already sorted deepest-first)
 foreach ($item in $foldersToRename) {
     # Critical: Re-resolve the current path because parent folders may have been renamed
-    # We need to find the item by its original name within its (possibly renamed) parent chain
-    $currentPath = $item.FullPath
+    # We need to find the item by navigating from root using original component names
+    $relativePath = $item.RelativePath
+    $pathParts = $relativePath.Split([System.IO.Path]::DirectorySeparatorChar)
     
-    # If the stored path doesn't exist, try to reconstruct it by walking up the tree
-    if (-not (Test-Path -Path $currentPath)) {
-        # Find the item by navigating from root using original component names
-        $relativePath = $currentPath.Substring($rootResolved.Length).TrimStart('\', '/')
-        $pathParts = $relativePath.Split([System.IO.Path]::DirectorySeparatorChar)
-        
-        $testPath = $rootResolved
-        foreach ($part in $pathParts) {
-            $found = $false
-            if (Test-Path -Path $testPath) {
-                $children = Get-ChildItem -Path $testPath -ErrorAction SilentlyContinue
-                foreach ($child in $children) {
-                    if ($child.Name -eq $part) {
-                        $testPath = $child.FullName
-                        $found = $true
-                        break
-                    }
+    $testPath = $rootResolved
+    foreach ($part in $pathParts) {
+        $found = $false
+        if (Test-Path -Path $testPath) {
+            $children = Get-ChildItem -Path $testPath -ErrorAction SilentlyContinue
+            foreach ($child in $children) {
+                # Match by original name OR already-translated name for robustness
+                if ($child.Name -eq $part -or 
+                    ($script:translationCache.ContainsKey($part) -and $child.Name -eq $script:translationCache[$part])) {
+                    $testPath = $child.FullName
+                    $found = $true
+                    break
                 }
             }
-            if (-not $found) {
-                Write-Host "  ⚠️  WARNING: Could not find folder '$part' in '$testPath'" -ForegroundColor Yellow
-                break
-            }
         }
-        $currentPath = $testPath
+        if (-not $found) {
+            Write-Host "  ⚠️  WARNING: Could not find folder '$part' in '$testPath'" -ForegroundColor Yellow
+            break
+        }
+    }
+    $currentPath = $testPath
+    
+    # Verify the path exists before attempting rename
+    if (-not (Test-Path -Path $currentPath)) {
+        Write-Host "  ❌ SKIPPED: Cannot locate folder $($item.OldName)" -ForegroundColor Red
+        $script:renameLog.Add(@{
+            OriginalPath = $item.FullPath
+            OriginalName = $item.OldName
+            Translation  = $item.NewName
+            ItemType     = $item.ItemType
+            Status       = "Failed"
+            Message      = "Could not locate folder at expected path"
+            Timestamp    = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        })
+        $renameCount++
+        $folderCount++
+        continue
     }
     
     # Update the item's FullPath for the rename operation
@@ -608,8 +629,53 @@ foreach ($item in $foldersToRename) {
     })
 }
 
-# Then rename files
+# Then rename files (also need to resolve paths in case parent folders were renamed)
 foreach ($item in $filesToRename) {
+    # Re-resolve the file path because parent folders may have been renamed
+    $relativePath = $item.RelativePath
+    $pathParts = $relativePath.Split([System.IO.Path]::DirectorySeparatorChar)
+    
+    $testPath = $rootResolved
+    foreach ($part in $pathParts) {
+        $found = $false
+        if (Test-Path -Path $testPath) {
+            $children = Get-ChildItem -Path $testPath -ErrorAction SilentlyContinue
+            foreach ($child in $children) {
+                if ($child.Name -eq $part) {
+                    $testPath = $child.FullName
+                    $found = $true
+                    break
+                }
+            }
+        }
+        if (-not $found) {
+            Write-Host "  ⚠️  WARNING: Could not find '$part' in '$testPath'" -ForegroundColor Yellow
+            break
+        }
+    }
+    $currentPath = $testPath
+    
+    # Verify the path exists before attempting rename
+    if (-not (Test-Path -Path $currentPath)) {
+        Write-Host "  ❌ SKIPPED: Cannot locate file $($item.OldName)" -ForegroundColor Red
+        $script:renameLog.Add(@{
+            OriginalPath = $item.FullPath
+            OriginalName = $item.OldName
+            Translation  = $item.NewName
+            ItemType     = $item.ItemType
+            Status       = "Failed"
+            Message      = "Could not locate file at expected path"
+            Timestamp    = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        })
+        $renameCount++
+        $fileCount++
+        continue
+    }
+    
+    # Update the item's FullPath for the rename operation
+    $item.FullPath = $currentPath
+    $item.ParentPath = Split-Path -Path $currentPath -Parent
+    
     $status = Invoke-SafeRename -Item $item -WhatIfMode $WhatIf
     $renameCount++
     $fileCount++

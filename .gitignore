@@ -1,1 +1,1 @@
-Nothing needs to be added to the .gitignore file since only a PowerShell script file (.ps1) was modified and no build artifacts, dependencies, or temporary files were detected in the changes.
+Nothing needs to be added to .gitignore since the only modified file is a PowerShell script (.ps1), which is a source code file and should not be ignored. The current .gitignore is empty and no build artifacts, dependencies, or temporary files are present in the changes.
