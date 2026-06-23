@@ -27,6 +27,7 @@ param(
     [switch]$WhatIf = $false,
     [switch]$SkipTranslation = $false,
     [switch]$SkipRename = $false,
+    [switch]$FilesOnly = $false,  # If set, only rename files (skip folders)
     [string]$TranslationService = "GoogleTranslate",  # GoogleTranslate or Manual (for testing)
     [int]$MaxTranslationRetries = 3
 )
@@ -345,10 +346,15 @@ function Get-ItemsForRenaming {
     $allItems = Get-ChildItem -Path $RootPath -Recurse -ErrorAction SilentlyContinue
     
     # Sort by depth (longest path first = deepest first)
-    $allItems = $allItems | Sort-Object { ($_.FullName -split '\\').Count } -Descending
+    $allItems = $allItems | Sort-Object { ($_.FullName -split '([char][System.IO.Path]::DirectorySeparatorChar)').Count } -Descending
     
     foreach ($item in $allItems) {
         if (Test-ContainsChinese -Text $item.Name) {
+            # Skip folders if FilesOnly mode is enabled
+            if ($FilesOnly -and $item.PSIsContainer) {
+                continue
+            }
+            
             # Get translation
             $translation = if ($SkipTranslation) { $item.Name } else { Get-ChineseTranslation -Text $item.Name }
             $translation = Sanitize-Filename -Name $translation
@@ -362,6 +368,7 @@ function Get-ItemsForRenaming {
                     NewName     = $translation
                     ItemType    = if ($item.PSIsContainer) { "Folder" } else { "File" }
                     HasChinese  = $true
+                    Depth       = ($item.FullName -split '([char][System.IO.Path]::DirectorySeparatorChar)').Count
                 }
             }
         }
@@ -403,19 +410,46 @@ function Invoke-SafeRename {
         # Check if target already exists
         $targetPath = Join-Path $Item.ParentPath $Item.NewName
         if ((Test-Path -Path $targetPath) -and ($targetPath -ne $Item.FullPath)) {
-            $status.Message = "Target already exists: $targetPath"
-            Write-Host "  ❌ CONFLICT: $($Item.OldName) → $($Item.NewName)" -ForegroundColor Red
-            return $status
+            # Handle naming conflict by appending a unique suffix
+            $baseName = $Item.NewName
+            $extension = ""
+            
+            # For files, preserve the extension
+            if ($Item.ItemType -eq "File") {
+                $lastDotIndex = $Item.NewName.LastIndexOf('.')
+                if ($lastDotIndex -gt 0) {
+                    $baseName = $Item.NewName.Substring(0, $lastDotIndex)
+                    $extension = $Item.NewName.Substring($lastDotIndex)
+                }
+            }
+            
+            # Generate unique name with counter
+            $counter = 1
+            do {
+                $newNameWithSuffix = "${baseName}_${counter}${extension}"
+                $targetPath = Join-Path $Item.ParentPath $newNameWithSuffix
+                $counter++
+            } while ((Test-Path -Path $targetPath) -and ($counter -lt 100))
+            
+            # Update the new name with the unique suffix
+            $Item.NewName = $newNameWithSuffix
+            $status.NewName = $newNameWithSuffix
+            $status.Message = "Conflict resolved: renamed to $newNameWithSuffix"
+            Write-Host "  ⚠️  CONFLICT RESOLVED: $($Item.OldName) → $($newNameWithSuffix)" -ForegroundColor Yellow
         }
         
         # Perform rename
         if ($WhatIfMode) {
-            $status.Message = "[SIMULATION] Would rename to: $targetPath"
+            if (-not $status.Message) {
+                $status.Message = "[SIMULATION] Would rename to: $targetPath"
+            }
             Write-Host "  🔍 [WHATIF] $($Item.OldName) → $($Item.NewName)" -ForegroundColor Blue
             $status.Success = $true
         } else {
             Rename-Item -Path $Item.FullPath -NewName $Item.NewName -ErrorAction Stop
-            $status.Message = "Successfully renamed to: $targetPath"
+            if (-not $status.Message) {
+                $status.Message = "Successfully renamed to: $targetPath"
+            }
             Write-Host "  ✅ RENAMED: $($Item.OldName) → $($Item.NewName)" -ForegroundColor Green
             $status.Success = $true
         }
@@ -477,6 +511,12 @@ if ($SkipTranslation) {
 } else {
     Write-Host "Service: $TranslationService" -ForegroundColor Gray
     Write-Host "Translating detected items..." -ForegroundColor Gray
+}
+
+if ($FilesOnly) {
+    Write-Host "Mode: Files Only (folders will not be renamed)" -ForegroundColor DarkCyan
+} else {
+    Write-Host "Mode: Files and Folders (full recursive renaming)" -ForegroundColor DarkCyan
 }
 
 $itemsToRename = Get-ItemsForRenaming -RootPath $rootResolved
@@ -587,6 +627,7 @@ $reportLines.Add("|-------|-------|")
 $reportLines.Add("| **Scan date** | ``$scanDate`` |")
 $reportLines.Add("| **Root directory** | ``$rootResolved`` |")
 $reportLines.Add("| **WhatIf mode** | ``$WhatIf`` |")
+$reportLines.Add("| **FilesOnly mode** | ``$FilesOnly`` |")
 $reportLines.Add("| **Translation service** | ``$TranslationService`` |")
 $reportLines.Add("| **Total folders (entire scan)** | $totalFolders |")
 $reportLines.Add("| **Total files (entire scan)** | $totalFiles |")
@@ -657,6 +698,12 @@ $reportLines.Add("- **Chinese characters detected:** $($script:itemsWithChinese)
 $reportLines.Add("- **Translation operations:** $($script:translationCache.Count)")
 $reportLines.Add("- **Rename operations:** $($script:renameLog.Count)")
 $reportLines.Add("")
+
+# Count folders and files renamed
+$foldersRenamed = ($script:renameLog | Where-Object { $_.ItemType -eq 'Folder' } | Measure-Object | Select-Object -ExpandProperty Count)
+$filesRenamed = ($script:renameLog | Where-Object { $_.ItemType -eq 'File' } | Measure-Object | Select-Object -ExpandProperty Count)
+$reportLines.Add("- **Folders renamed:** $foldersRenamed")
+$reportLines.Add("- **Files renamed:** $filesRenamed")
 
 if ($WhatIf) {
     $reportLines.Add("> ⚠️  **This report was generated in WHATIF mode.** No actual filesystem changes were made.")
