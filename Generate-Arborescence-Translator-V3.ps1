@@ -641,7 +641,9 @@ foreach ($item in $filesToRename) {
         if (Test-Path -Path $testPath) {
             $children = Get-ChildItem -Path $testPath -ErrorAction SilentlyContinue
             foreach ($child in $children) {
-                if ($child.Name -eq $part) {
+                # Match by original name OR already-translated name for robustness
+                if ($child.Name -eq $part -or 
+                    ($script:translationCache.ContainsKey($part) -and $child.Name -eq $script:translationCache[$part])) {
                     $testPath = $child.FullName
                     $found = $true
                     break
